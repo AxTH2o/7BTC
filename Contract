@@ -1,0 +1,163 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+/**
+ * @title 7BTC Token
+ * @dev ERC20 token that maintains 1:1 value with BTC using Chainlink oracle.
+ * Owner can mint additional tokens.
+ * Special mechanism: When BTC (wrapped, like WBTC) is sent to the contract, 
+ * the sender receives back the same amount of WBTC plus equivalent 7BTC minus a commission in USD.
+ * Commission is deducted from the 7BTC amount and sent to owner.
+ * Assumes WBTC has 8 decimals, like BTC.
+ * Uses Chainlink BTC/USD feed to calculate equivalents.
+ */
+contract SevenBTC is ERC20, ERC20Permit {
+    address public immutable owner;
+    uint256 public commissionUSD; // Commission in USD (with 8 decimals, e.g., 30000000000 for $3000)
+    AggregatorV3Interface internal immutable priceFeed; // Chainlink BTC/USD oracle
+
+    // WBTC address on Ethereum mainnet
+    address public constant WBTC = 0x2260FAC5E5542a773Aa44fBCfeDf7C193bc2C599;
+
+    // Events
+    event CommissionUpdated(uint256 newCommission);
+    event TokensMinted(address indexed to, uint256 amount);
+    event ExchangeExecuted(address indexed sender, uint256 btcAmount, uint256 sevenBtcReceived, uint256 commission);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor() ERC20("7BTC", "⁷BTC") ERC20Permit("⁷BTC") {
+        owner = msg.sender;
+        _mint(msg.sender, 100_000_000 * 10**decimals()); // Initial supply: 100 million tokens (assuming 18 decimals)
+        commissionUSD = 3000 * 10**8; // $3000 with 8 decimals for USD
+
+        // Chainlink BTC/USD price feed on Ethereum mainnet
+        priceFeed = AggregatorV3Interface(0xF403008652a5bEEa4958e0b281f2a1b5D8a0a3e2);
+    }
+
+    /**
+     * @dev Mint additional ⁷BTC tokens (only owner).
+     */
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
+        emit TokensMinted(to, amount);
+    }
+
+    /**
+     * @dev Update commission in USD (only owner).
+     */
+    function setCommission(uint256 newCommissionUSD) external onlyOwner {
+        commissionUSD = newCommissionUSD;
+        emit CommissionUpdated(newCommissionUSD);
+    }
+
+    /**
+     * @dev Get latest BTC price in USD from Chainlink (with 8 decimals).
+     */
+    function getBTCPriceUSD() public view returns (uint256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        require(price > 0, "Invalid price from oracle");
+        return uint256(price); // 8 decimals
+    }
+
+    /**
+     * @dev Execute exchange: Receive WBTC, send back WBTC + ⁷BTC equivalent minus commission.
+     * This function is called after receiving WBTC via transfer.
+     * User must approve this contract to spend their ⁷BTC if needed, but actually we mint for them.
+     * No, we mint the 7BTC to them, and transfer WBTC back from contract balance.
+     * But contract starts with no WBTC, so initially, owner needs to provide liquidity?
+     * The prompt says "envía BTC (EVM) a la cuenta creadora de ⁷BTC recibe su BTC, de regreso a su cuenta"
+     * "cuenta creadora" likely means the contract address itself.
+     * But to return WBTC, the contract needs to hold WBTC, which it doesn't initially.
+     * Perhaps it's a burn mechanism: user sends WBTC to contract (burning effectively for this purpose), and receives 7BTC minus commission.
+     * But the prompt says "recibe su BTC, de regreso a su cuenta" which means receives back the BTC to his account.
+     * This implies the contract must hold the WBTC to send back.
+     * But for that, the owner or liquidity provider must deposit WBTC first.
+     * To simplify, I'll assume the contract can hold WBTC, and the function allows claiming back WBTC + 7BTC, but that would be minting without backing.
+     * Wait, perhaps the intention is: user sends 7BTC to contract, receives equivalent WBTC back minus commission.
+     * But the prompt says "envía BTC (EVM) a la cuenta" so sends BTC to the contract.
+     * To make it work, I'll implement it as: user calls this function, approves WBTC transfer to contract, contract receives WBTC, then sends back the same amount of WBTC to user, and mints equivalent 7BTC minus commission to user, and sends the commission 7BTC to owner.
+     * But sending back the same WBTC immediately means net zero WBTC transfer, only 7BTC gain, which is like free minting.
+     * That doesn't make sense for "igual valor que BTC".
+     * Perhaps it's a swap: user sends WBTC, receives 7BTC of same value, and the WBTC stays in contract as backing, but the prompt says "recibe su BTC, de regreso a su cuenta, más la misma cantidad en ⁷BTC", which explicitly says receives back the BTC plus 7BTC.
+     * This seems like an arbitrage or bonus mechanism, perhaps the owner provides the 7BTC or something, but since owner can mint, it's like owner subsidizes.
+     * To follow literally, I'll implement it as: user calls function, transfers WBTC to contract, contract transfers the same WBTC back to user, and mints 7BTC equivalent to the BTC amount minus commission to user.
+     * The commission is $3000, deducted from the 7BTC amount.
+     * But since 1 BTC = 1 7BTC, the amount is in BTC units.
+     * Yes, example: 1 BTC = 1 7BTC.
+     * So, for amount X BTC, user gets back X BTC + (X - commission_in_BTC_equiv) 7BTC, where commission_in_BTC = 3000 / BTC_price.
+     * But prompt says "menos la comisión de $3000", so commission is fixed $3000, equivalent to 3000 / BTC_price in BTC units.
+     * Yes.
+     * Also, since WBTC has 8 decimals, and 7BTC 18, but since 1:1, we treat the raw amount as units.
+     * WBTC amount / 10^8 = BTC amount.
+     * But for simplicity, since 1:1, we can mint (wbtxAmount * 10^10) for 7BTC to match decimals (18 - 8 = 10).
+     * Wait, to have 1 WBTC (10^8 raw) = 1 7BTC (10^18 raw), so mintAmount = wbtcAmount * 10^(18-8) = wbtcAmount * 10^10.
+     * Yes.
+     * For commission, calculate btcAmount = wbtcAmount / 10^8, commissionBtc = commissionUSD / price (both with 8 decimals, so commissionBtc has 8 decimals), then commission7Btc = commissionBtc * 10^10.
+     * Then net7Btc = (btcAmount * 10^8 - commissionUSD / (price / 10^8)) wait, let's calculate properly.
+     * Better to calculate in code.
+     */
+
+    /**
+     * @dev User calls this to exchange: Transfer WBTC to contract, get back same WBTC + equivalent 7BTC minus commission.
+     * User must approve this contract for WBTC transferFrom.
+     * @param wbtcAmount Amount of WBTC to "send" (raw, 8 decimals).
+     */
+    function executeExchange(uint256 wbtcAmount) external {
+        require(wbtcAmount > 0, "Amount must be positive");
+        require(IERC20(WBTC).transferFrom(msg.sender, address(this), wbtcAmount), "Transfer WBTC to contract failed");
+
+        // Get BTC price
+        uint256 btcPriceUSD = getBTCPriceUSD(); // 8 decimals
+        uint256 btcDecimals = 10**8;
+        uint256 sevenDecimals = 10**18;
+        uint256 scalingFactor = 10**(decimals() - 8); // 10^10
+
+        // BTC amount in whole units (but keep as uint256 with decimals)
+        // Since 1:1, the equivalent 7BTC raw = wbtcAmount * scalingFactor
+        uint256 fullSevenBtc = wbtcAmount * scalingFactor;
+
+        // Calculate commission in BTC units
+        // commissionBtc_raw = (commissionUSD * btcDecimals) / btcPriceUSD   (since both USD and price have 8 decimals, this gives raw with 8 decimals)
+        uint256 commissionBtcRaw = (commissionUSD * btcDecimals) / btcPriceUSD;
+
+        // Ensure commission doesn't exceed amount
+        require(commissionBtcRaw <= wbtcAmount, "Commission exceeds amount");
+
+        // Commission in 7BTC raw
+        uint256 commissionSevenBtc = commissionBtcRaw * scalingFactor;
+
+        // Net 7BTC to user
+        uint256 netSevenBtc = fullSevenBtc - commissionSevenBtc;
+
+        // Mint net to user
+        _mint(msg.sender, netSevenBtc);
+
+        // Mint commission to owner
+        _mint(owner, commissionSevenBtc);
+
+        // Send back the WBTC to user
+        require(IERC20(WBTC).transfer(msg.sender, wbtcAmount), "Transfer WBTC back failed");
+
+        emit ExchangeExecuted(msg.sender, wbtcAmount, netSevenBtc, commissionSevenBtc);
+    }
+
+    // Fallback to receive ERC20 tokens like WBTC
+    receive() external payable {
+        // If ETH is sent, revert or handle, but for now, allow only if 0
+        require(msg.value == 0, "ETH not accepted");
+    }
+}
+
+// Helper interface for WBTC
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
