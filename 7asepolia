@@ -1,0 +1,51 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.19;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/access/Ownable.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+interface IERC20BTC {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
+
+contract SevenBTC is ERC20, Ownable {
+    AggregatorV3Interface internal priceFeed;
+    address public btcTokenAddress;
+    uint256 public commissionUSD = 3000 * 1e8; // $3000 con 8 decimales
+
+    constructor(address _btcTokenAddress, address _priceFeedAddress) ERC20("⁷BTC", "⁷BTC") {
+        _mint(msg.sender, 100_000_000 * 10 ** decimals());
+        btcTokenAddress = _btcTokenAddress;
+        priceFeed = AggregatorV3Interface(_priceFeedAddress);
+    }
+
+    function setCommissionUSD(uint256 newCommissionUSD) external onlyOwner {
+        commissionUSD = newCommissionUSD;
+    }
+
+    function getBTCPrice() public view returns (uint256) {
+        (, int price,,,) = priceFeed.latestRoundData(0x9d7E9C5B7D0E1f3e3a7D3C8C3F1F3C8C3F1F3C8C);
+        return uint256(price); // BTC/USD con 8 decimales
+    }
+
+    function getCommissionInBTC() public view returns (uint256) {
+        uint256 btcPrice = getBTCPrice();
+        return (commissionUSD * 1e8) / btcPrice;
+    }
+
+    function exchangeBTC(uint256 amountBTC) external {
+        uint256 commissionBTC = getCommissionInBTC();
+        require(amountBTC > commissionBTC, "Amount must exceed commission");
+
+        IERC20BTC btc = IERC20BTC(btcTokenAddress);
+
+        require(btc.transferFrom(msg.sender, address(this), amountBTC), "BTC transfer failed");
+
+        uint256 refundBTC = amountBTC - commissionBTC;
+        require(btc.transfer(msg.sender, refundBTC), "BTC refund failed");
+
+        _mint(msg.sender, refundBTC);
+    }
+}
