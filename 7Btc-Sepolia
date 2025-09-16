@@ -1,0 +1,124 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import "@openzeppelin/contracts/token/ERC20/ERC20.sol";
+import "@openzeppelin/contracts/token/ERC20/extensions/ERC20Permit.sol";
+import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV3Interface.sol";
+
+/**
+ * @title 7BTC Token
+ * @dev ERC20 token on Sepolia testnet that maintains 1:1 value with BTC using Chainlink oracle.
+ * Owner can mint additional tokens.
+ * Special mechanism: When WBTC is sent to the contract, 
+ * the sender receives back the same amount of WBTC plus equivalent 7BTC minus a commission in USD.
+ * Commission is deducted from the 7BTC amount and sent to owner.
+ * Assumes WBTC has 8 decimals, like BTC.
+ * Uses Chainlink BTC/USD feed on Sepolia.
+ */
+contract SevenBTC is ERC20, ERC20Permit {
+    address public immutable owner;
+    uint256 public commissionUSD; // Commission in USD (with 8 decimals, e.g., 30000000000 for $3000)
+    AggregatorV3Interface internal immutable priceFeed; // Chainlink BTC/USD oracle
+
+    // Placeholder WBTC address on Sepolia (replace with actual testnet WBTC address or deploy a mock)
+    address public constant WBTC = 0x0000000000000000000000000000000000000000; // TODO: Replace with Sepolia WBTC address
+
+    // Events
+    event CommissionUpdated(uint256 newCommission);
+    event TokensMinted(address indexed to, uint256 amount);
+    event ExchangeExecuted(address indexed sender, uint256 btcAmount, uint256 sevenBtcReceived, uint256 commission);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Not owner");
+        _;
+    }
+
+    constructor() ERC20("7BTC", "⁷BTC") ERC20Permit("⁷BTC") {
+        owner = msg.sender;
+        _mint(msg.sender, 100_000_000 * 10**decimals()); // Initial supply: 100 million tokens (18 decimals)
+        commissionUSD = 3000 * 10**8; // $3000 with 8 decimals for USD
+
+        // Chainlink BTC/USD price feed on Sepolia testnet
+        priceFeed = AggregatorV3Interface(0x1b44F3514812d835EB1BDB0acB33d3fA3351Ee43);
+    }
+
+    /**
+     * @dev Mint additional ⁷BTC tokens (only owner).
+     */
+    function mint(address to, uint256 amount) external onlyOwner {
+        _mint(to, amount);
+        emit TokensMinted(to, amount);
+    }
+
+    /**
+     * @dev Update commission in USD (only owner).
+     */
+    function setCommission(uint256 newCommissionUSD) external onlyOwner {
+        commissionUSD = newCommissionUSD;
+        emit CommissionUpdated(newCommissionUSD);
+    }
+
+    /**
+     * @dev Get latest BTC price in USD from Chainlink (with 8 decimals).
+     */
+    function getBTCPriceUSD() public view returns (uint256) {
+        (, int256 price, , , ) = priceFeed.latestRoundData();
+        require(price > 0, "Invalid price from oracle");
+        return uint256(price); // 8 decimals
+    }
+
+    /**
+     * @dev Execute exchange: Transfer WBTC to contract, get back same WBTC + equivalent 7BTC minus commission.
+     * User must approve this contract for WBTC transferFrom.
+     * @param wbtcAmount Amount of WBTC to send (raw, 8 decimals).
+     */
+    function executeExchange(uint256 wbtcAmount) external {
+        require(wbtcAmount > 0, "Amount must be positive");
+        require(WBTC != address(0), "WBTC address not set");
+        require(IERC20(WBTC).transferFrom(msg.sender, address(this), wbtcAmount), "Transfer WBTC to contract failed");
+
+        // Get BTC price
+        uint256 btcPriceUSD = getBTCPriceUSD(); // 8 decimals
+        uint256 btcDecimals = 10**8;
+        uint256 sevenDecimals = 10**18;
+        uint256 scalingFactor = 10**(decimals() - 8); // 10^10, since 7BTC has 18 decimals, WBTC 8
+
+        // Equivalent 7BTC raw amount = wbtcAmount * scalingFactor (since 1:1 value)
+        uint256 fullSevenBtc = wbtcAmount * scalingFactor;
+
+        // Calculate commission in BTC units
+        // commissionBtcRaw = (commissionUSD * btcDecimals) / btcPriceUSD
+        uint256 commissionBtcRaw = (commissionUSD * btcDecimals) / btcPriceUSD;
+
+        // Ensure commission doesn't exceed amount
+        require(commissionBtcRaw <= wbtcAmount, "Commission exceeds amount");
+
+        // Commission in 7BTC raw
+        uint256 commissionSevenBtc = commissionBtcRaw * scalingFactor;
+
+        // Net 7BTC to user
+        uint256 netSevenBtc = fullSevenBtc - commissionSevenBtc;
+
+        // Mint net 7BTC to user
+        _mint(msg.sender, netSevenBtc);
+
+        // Mint commission to owner
+        _mint(owner, commissionSevenBtc);
+
+        // Send back the WBTC to user
+        require(IERC20(WBTC).transfer(msg.sender, wbtcAmount), "Transfer WBTC back failed");
+
+        emit ExchangeExecuted(msg.sender, wbtcAmount, netSevenBtc, commissionSevenBtc);
+    }
+
+    // Fallback to receive ERC20 tokens like WBTC
+    receive() external payable {
+        require(msg.value == 0, "ETH not accepted");
+    }
+}
+
+// Helper interface for WBTC
+interface IERC20 {
+    function transfer(address to, uint256 amount) external returns (bool);
+    function transferFrom(address from, address to, uint256 amount) external returns (bool);
+}
